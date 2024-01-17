@@ -23,6 +23,13 @@ import ckanext.datapusher.interfaces as interfaces
 
 import tempfile
 import hashlib
+import os
+import shutil
+
+import ckan.lib.uploader as uploader
+CHUNK_SIZE = 64 * 1024 #64KB
+DOWNLOAD_TIMEOUT = 60
+MAX_CONTENT_LENGTH = config.get('ckan.max_resource_size') # or define
 
 log = logging.getLogger(__name__)
 _get_or_bust = logic.get_or_bust
@@ -214,6 +221,10 @@ def datapusher_hook(context: Context, data_dict: dict[str, Any]):
     # on the auth checks
     p.toolkit.check_access('datapusher_submit', context, metadata)
 
+    # add resource_upload logic for data harvesting
+    #
+    res_dict = p.toolkit.get_action('resource_show')(context, {'id': res_id})
+
     task = p.toolkit.get_action('task_status_show')(context, {
         'entity_id': res_id,
         'task_type': 'datapusher',
@@ -269,6 +280,14 @@ def datapusher_hook(context: Context, data_dict: dict[str, Any]):
 
     context['ignore_auth'] = True
     p.toolkit.get_action('task_status_update')(context, task)
+
+    # add resource_upload logic for data harvesting
+    #
+    log.info('call resource_upload function in datapusher_hook')
+    resource_upload(context, res_dict)
+
+    # p.toolkit.get_action('resource_update')(context, {'id': res_id})
+    res_dict['extras'] = res_dict['url']
 
     if resubmit:
         log.debug('Resource {0} has been modified, '
@@ -339,3 +358,115 @@ def datapusher_status(
         'task_info': job_detail,
         'error': json.loads(task['error'])
     }
+
+def resource_upload(context, data_dict):
+
+
+    if 'url' in data_dict:
+        url = data_dict['url']
+    else:
+        url = data_dict['access_url']
+
+    resource_id = data_dict['id']
+    headers = {}
+    if 'cache_last_updated' or 'cache_url' or 'mediatype_inner' in data_dict:
+        data_dict['cache_last_updated'] = None
+        data_dict['cache_url'] = None
+        data_dict['mediatype_inner'] = None
+    log.info('call resource_upload for {0} resource'.format(resource_id))
+    upload = uploader.get_resource_uploader(data_dict)
+
+    log.info('download all distributions in harvested packages id: %s', resource_id)
+
+    try:
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=DOWNLOAD_TIMEOUT,
+            stream=True,  # just gets the headers for now
+        )
+        response.raise_for_status()
+        cl = response.headers.get('content-length')
+
+        log.info(response.headers)
+        ct = response.headers.get('Content-Type')
+        fn = response.headers.get('filename')
+        if cl and int(cl) > MAX_CONTENT_LENGTH:
+            raise p.toolkit.ValidationError('Resource too large to download:{cl} > max ({max_cl})'
+                                            .format(cl=cl, max_cl=MAX_CONTENT_LENGTH))
+            # raise util.JobError(
+            #     'Resource too large to download: {cl} > max ({max_cl}).'
+            #        .format(cl=cl, max_cl=MAX_CONTENT_LENGTH))
+        directory = upload.get_directory(resource_id)
+        filepath = upload.get_path(resource_id)
+        filename = data_dict['name']
+        max_size = MAX_CONTENT_LENGTH
+        temp = tempfile.TemporaryFile()
+        length = 0
+        log.debug('Start Download Resource {0}'.format(resource_id))
+
+        for chunk in response.iter_content(CHUNK_SIZE):  # resource store in tempfile
+            length += len(chunk)
+            if length > MAX_CONTENT_LENGTH:
+                raise p.toolkit.ValidationError('Resource too large to download:{cl} > max ({max_cl})'
+                                                .format(cl=cl, max_cl=MAX_CONTENT_LENGTH))
+                # raise util.JobError(
+                #     'Resource too large to process: {cl} > max ({max_cl}).'
+                #         .format(cl=length, max_cl=MAX_CONTENT_LENGTH))
+            temp.write(chunk)
+        log.debug('Finish Download Resource File in Tempfile')
+
+
+        if filename:
+            try:
+                os.makedirs(directory)
+            except OSError, e:
+                if e.errno != 17:
+                    raise
+            tmp_filepath = filepath + '~'
+            d_tmp_filepath = filepath + '~'
+            output_file = open(tmp_filepath, 'wb+')
+            d_output_file = open(d_tmp_filepath, 'wb+')
+            temp.seek(0)
+            current_size = 0
+            while True:
+                current_size = current_size + 1
+                # MB chunks
+                real_data = temp.read(2 ** 20)
+                if not real_data:
+                    break
+                output_file.write(real_data)
+                d_output_file.write(real_data)
+                if current_size > max_size:
+                    os.remove(tmp_filepath)
+                    # print(current_size)
+                    raise logic.ValidationError(
+                        {'upload': ['File upload too large']}
+                    )
+            
+            output_file.close()
+            os.rename(tmp_filepath, filepath)
+
+        log.debug('Real Data Import finished')
+
+    except requests.exceptions.HTTPError, e:
+        m = "DataPusher received a bad HTTP response when trying to download the data file"
+        log.debug('ckanext/datapusher/logic/action.py resource_upload 278 line requests.exceptions.HTTPError')
+        try:
+            body = e.response.json()
+        except ValueError:
+            body = e.response.text
+        error = {'message': m,
+                 'details': body,
+                 'status_code': response.status_code}
+        raise p.toolkit.ValidationError(error)
+    except requests.HTTPError as e:
+        raise HTTPError(
+            "DataPusher received a bad HTTP response when trying to download "
+            "the data file", status_code=e.response.status_code,
+            request_url=url, response=e.response.content)
+    except requests.exceptions.RequestException as e:
+        log.debug('ckanext/datapusher/logic/action.py 342 line requests.exceptions.RequestException Error')
+        error = {'message': str(e),
+                 'status_code': None}
+        raise p.toolkit.ValidationError(error)
